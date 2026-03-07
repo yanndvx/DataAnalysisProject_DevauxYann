@@ -1,0 +1,31 @@
+{
+    "Name": "MOXY",
+    "BIDSVersion": "1.11.1",
+    "DatasetType": "raw",
+    "License": "CC0",
+    "Authors": [
+        "G. Belda",
+        "L. Borot",
+        "Y. Devaux",
+        "H. Duchemin",
+        "G. Dray",
+        "B. Nicolas",
+        "S. Perrey",
+        "G. Vergotte"
+    ],
+    "Keywords": [
+        "mNIRS",
+        "Eccentric contraction",
+        "Concentric contraction",
+        "Occlusion"
+    ],
+    "EthicsApprovals": [
+        "CERSTAPS : IRB00012476-2026-22-01-459"
+    ],
+    "GeneratedBy": [
+        {
+            "Name": "G. Vergotte",
+            "Version": "0.1.0"
+        }
+    ]
+}

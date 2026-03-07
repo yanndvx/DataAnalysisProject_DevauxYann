@@ -1,0 +1,11 @@
+{
+    "InstitutionName": "Euromov Digital Health in Motion",
+    "InstitutionAddress": "700 avenue du Pic Saint Loup, 34090, Montpellier, France",
+    "Manufacturer": "Artinis",
+    "ManufacturersModelName": "Portalite",
+    "SamplingFrequency": 10,
+    "NIRSChannelCount": 3,
+    "NIRSSourceOptodeCount": 3,
+    "NIRSDetectorOptodeCount": 1,
+    "NIRSPlacementScheme": "n/a"
+}

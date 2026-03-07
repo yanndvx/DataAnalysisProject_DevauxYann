@@ -1,0 +1,6 @@
+{
+    "SamplingFrequency": 500.0,
+    "StartTime": 0,
+    "Unit": "deg/s",
+    "Description": "Raw Biodex angle"
+}
