@@ -1,0 +1,9 @@
+{
+    "SamplingFrequency": 500.0,
+    "StartTime": 0,
+    "Columns": [
+        "velocity"
+    ],
+    "Unit": "deg/s",
+    "Description": "Raw Biodex velocity"
+}

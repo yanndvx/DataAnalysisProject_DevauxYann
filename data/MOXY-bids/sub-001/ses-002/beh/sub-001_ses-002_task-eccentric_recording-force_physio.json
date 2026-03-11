@@ -4,5 +4,6 @@
     "Columns": [
         "torque"
     ],
-    "Unit": "Nm"
+    "Unit": "Nm",
+    "Description": "Raw Biodex force/torque"
 }

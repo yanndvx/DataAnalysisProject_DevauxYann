@@ -29,7 +29,7 @@ library(broom.mixed)
 
 # 1-load data ----
 # CR100 Borg scale data file (formatted in long form)
-data <- read_excel("directory to set")
+data <- read_excel("C:/Program Files/DigiMove/DigiMove/DataAnalysisProject/data/MOXY-bids/MOXY-bids/phenotype/moxy_rpe_table.xlsx")
 
 # Make factors (e.g. unsure all conditions are considered as a factor for the following steps)
 data$condition <-as.factor(data$condition)
@@ -76,7 +76,7 @@ check_singularity(lmerRPE)
 # if singular fit, run reduced model, random slope without correlation with intercept (force independence)
 # e.g. lmerRPE2<- lmer(rpe ~ condition * intensity + trial + (1  | subject) + (0 + condition  | subject) + (0 + intensity  | subject) + (0 + condition:intensity  | subject),control=lmerControl(optimizer="bobyqa",optCtrl=list(maxfun=2e6)),data = data)
 # if still singular fit then reduce again 
- 
+
 # 3bis-Model comparison ----
 # comparisons of models (using likelihood ratio test), if non significant use parsimonious principle
 anova(lmerRPE,lmerRPE2)
@@ -136,6 +136,7 @@ ggplot(em_interaction, aes(x = intensity, y = emmean, color = condition, group =
 # Extract random effects
 re_effects <- as.data.frame(ranef(lmerRPE))
 
+
 # Filter for just the Intercept to see overall subject differences
 ggplot(re_effects[re_effects$term == "(Intercept)", ], 
        aes(x = reorder(grp, condval), y = condval)) +
@@ -170,3 +171,4 @@ ggplot(augmented_data, aes(x = intensity, y = .fitted, color = condition)) +
   facet_wrap(~condition) +
   theme_bw() +
   theme(panel.grid = element_blank(), legend.position = "none")
+
