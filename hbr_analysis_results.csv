@@ -1,0 +1,5 @@
+Subject;Session;Task;Contraction_Mode;Intensity;Mean_HbR_uM;Std_HbR_uM;Number_of_Series
+001;001;concentric;Concentric;30%;-0,766857557574896;0,08978257811236955;3
+001;001;concentric;Concentric;50%;-1,2098846358330777;0,10321100982570462;3
+001;002;eccentric;Eccentric;30%;-2,378993233302866;0,6130794345188929;3
+001;002;eccentric;Eccentric;50%;-2,880272238795333;0,5354882394453473;3

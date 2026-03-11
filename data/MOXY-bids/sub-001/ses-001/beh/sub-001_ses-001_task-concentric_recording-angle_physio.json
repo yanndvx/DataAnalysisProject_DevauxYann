@@ -4,6 +4,5 @@
     "Columns": [
         "velocity"
     ],
-    "Unit": "deg/s",
-    "Description": "Raw Biodex velocity"
+    "Unit": "deg/s"
 }

@@ -1,9 +1,0 @@
-{
-    "SamplingFrequency": 500.0,
-    "StartTime": 0,
-    "Columns": [
-        "torque"
-    ],
-    "Unit": "Nm",
-    "Description": "Raw Biodex force/torque"
-}

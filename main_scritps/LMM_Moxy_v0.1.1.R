@@ -29,7 +29,7 @@ library(broom.mixed)
 
 # 1-load data ----
 # CR100 Borg scale data file (formatted in long form)
-data <- read_excel("C:/Program Files/DigiMove/DigiMove/DataAnalysisProject/data/MOXY-bids/MOXY-bids/phenotype/moxy_rpe_table.xlsx")
+data <- read_excel("C:/Program Files/DigiMove/DigiMove/DataAnalysisProject/data/MOXY-bids/phenotype/moxy_rpe_table.xlsx")
 
 # Make factors (e.g. unsure all conditions are considered as a factor for the following steps)
 data$condition <-as.factor(data$condition)
@@ -79,7 +79,7 @@ check_singularity(lmerRPE)
 
 # 3bis-Model comparison ----
 # comparisons of models (using likelihood ratio test), if non significant use parsimonious principle
-anova(lmerRPE,lmerRPE2)
+#anova(lmerRPE,lmerRPE2)
  
 # 4-Return main and interaction effects of full  model ----
 Anova(lmerRPE, type = "2",test.statistic="Chi")
