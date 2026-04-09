@@ -1,0 +1,8 @@
+{
+    "SamplingFrequency": 499.9910618145134,
+    "StartTime": 0,
+    "Columns": [
+        "velocity"
+    ],
+    "Unit": "deg/s"
+}

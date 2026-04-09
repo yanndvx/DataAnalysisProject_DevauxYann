@@ -1,5 +1,5 @@
 {
-    "SamplingFrequency": 500.0,
+    "SamplingFrequency": 499.99117265037455,
     "StartTime": 0,
     "Columns": [
         "torque"

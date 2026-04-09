@@ -1,0 +1,8 @@
+{
+    "SamplingFrequency": 499.9912987365115,
+    "StartTime": 0,
+    "Columns": [
+        "torque"
+    ],
+    "Unit": "Nm"
+}
