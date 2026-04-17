@@ -1,16 +1,20 @@
 import os
-
+import h5py
 import mne
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from mne_bids import BIDSPath, read_raw_bids
+from scipy.signal import hilbert
+
+# Install the external dependencies with pip if they are not already available:
+# mne, matplotlib, numpy, pandas, and mne-bids.
 
 """# NIRS Oxymove Utilities
 
-Fonctions classees par usage pour faciliter la lecture et la maintenance.
+Functions grouped by purpose to make the module easier to read and maintain.
 
-## 1) Helpers internes (infrastructure)
+## 1) Internal helpers
 - _empty_device_stats
 - _find_first_session_for_task
 - _style_epoch_axis
@@ -20,31 +24,32 @@ Fonctions classees par usage pour faciliter la lecture et la maintenance.
 - _default_output_dir_from_base_root
 - _collect_metric_values
 
-## 2) Chargement et pre-traitement des signaux
+## 2) Signal loading and preprocessing
 - load_filtered_hb
 - get_hbr_channels
 - epoch_signal
 
-## 3) Extraction de metriques HbR
+## 3) HbR metric extraction
 - extract_hbr_means
 - compute_condition_hbr_average
 - mean_std
 - extract_temporal_features
 
-## 4) Visualisation
+## 4) Visualization
 - plot_device
 - print_block
 - plot_temporal_comparison
 - _plot_epochs_one_by_one
 - _plot_intensity_per_row
 - plot_envelope_and_auc_per_set
+- plot_hbr_hbo_mean_and_auc_by_device
 - display_sets_one_by_one
 
-## 5) Logique de mapping task/session
+## 5) Task/session mapping logic
 - infer_task_from_session
 - build_events_file
 
-## 6) Analyses comparatives et exports
+## 6) Comparative analyses and exports
 - process_device
 - compare_devices_by_task
 - compare_devices_all_subjects
@@ -55,21 +60,23 @@ Fonctions classees par usage pour faciliter la lecture et la maintenance.
 """
 
 
-DEFAULT_BASE_ROOT = r'C:\Program Files\DigiMove\DigiMove\DataAnalysisProject\data\MOXY-bids'
-DEFAULT_WINDOW_DURATION = 30
-DEVICE_COLORS = {'semaxone': '#D63DDB', 'portalite': '#D8C730'}
+DEFAULT_BASE_ROOT = r'C:\Program Files\DigiMove\DigiMove\DataAnalysisProject\data\MOXY-bids' # Default root directory for BIDS data
+DEFAULT_ANALYSIS_RESULTS_DIR = r'C:\Program Files\DigiMove\DigiMove\DataAnalysisProject\Analysis_Results'
+DEFAULT_WINDOW_DURATION = 30 # Default duration (in seconds) of the analysis window after trial onset
+DEVICE_COLORS = {'semaxone': "#4E0451", 'portalite': "#4F8A02"} 
 CHROMOPHORE_COLORS = {
     'HbR': 'red',
     'HbO': 'blue',
+
     'HbDiff': 'yellow',
     'HbTot': 'green',
 }
 
 
 # -----------------------------------------------------------------------------
-# 1) Helpers internes (infrastructure)
+# 1) Structure
 # -----------------------------------------------------------------------------
-def _empty_device_stats():
+def _empty_device_stats(): 
     """Return a standardized empty stats dict for unavailable device/task."""
     return {
         'available': False,
@@ -103,7 +110,7 @@ def _find_first_session_for_task(base_root, subject_id, task_name):
     return None
 
 
-def _style_epoch_axis(ax, title=None, xlabel='Temps (s)', ylabel='ΔHbR (uM)'):
+def _style_epoch_axis(ax, title=None, xlabel='Time (s)', ylabel='ΔHbR (uM)'):
     """Apply consistent styling for time-series epoch plots."""
     ax.axvline(0, color='gray', linestyle='--', linewidth=1, alpha=0.6)
     ax.axhline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.4)
@@ -128,14 +135,102 @@ def _integrate_auc(values, times):
     return float(np.trapz(values, times))
 
 
+def _decode_snirf_text(value):
+    """Decode SNIRF string values to plain Python text."""
+    if isinstance(value, bytes):
+        return value.decode('utf-8')
+    return str(value)
+
+
+def _get_snirf_sensor_pairs(snirf_path):
+    """Read source-detector pairs and distances from a SNIRF file."""
+    with h5py.File(snirf_path, 'r') as snirf_file:
+        probe = snirf_file['nirs']['probe']
+        source_positions = np.asarray(probe['sourcePos3D'][...], dtype=float)
+        detector_positions = np.asarray(probe['detectorPos3D'][...], dtype=float)
+        source_labels = [_decode_snirf_text(value) for value in probe['sourceLabels'][...]]
+        detector_labels = [_decode_snirf_text(value) for value in probe['detectorLabels'][...]]
+
+    pairs = []
+    for source_idx, source_position in enumerate(source_positions, start=1):
+        for detector_idx, detector_position in enumerate(detector_positions, start=1):
+            distance_mm = float(np.linalg.norm(source_position - detector_position) * 1000.0)
+            pairs.append({
+                'source_idx': source_idx,
+                'detector_idx': detector_idx,
+                'source_label': source_labels[source_idx - 1],
+                'detector_label': detector_labels[detector_idx - 1],
+                'distance_mm': distance_mm,
+            })
+
+    return pairs
+
+
+def _select_sensor_pairs_for_recording(snirf_path, recording):
+    """Return the sensor pair or pairs to keep for a given device recording."""
+    recording_key = str(recording).strip().lower()
+    sensor_pairs = _get_snirf_sensor_pairs(snirf_path)
+
+    def _select_requested_pairs(requested_pairs):
+        selected_pairs = []
+        for requested_pair in requested_pairs:
+            match = next(
+                (
+                    pair
+                    for pair in sensor_pairs
+                    if (pair['source_idx'], pair['detector_idx']) == requested_pair
+                ),
+                None,
+            )
+            if match is None:
+                raise RuntimeError(
+                    f"Requested sensor pair S{requested_pair[0]}_D{requested_pair[1]} "
+                    f"not found in {os.path.basename(snirf_path)}."
+                )
+            selected_pairs.append(match)
+        return selected_pairs
+
+    if recording_key == 'portalite':
+        # Portalite: keep only S2_D1.
+        return _select_requested_pairs([(2, 1)])
+
+    if recording_key == 'semaxone':
+        # Semaxone: keep S2_D1, S2_D3, S1_D2, and S1_D4.
+        requested_pairs = [(2, 1), (2, 3), (1, 2), (1, 4)]
+        return _select_requested_pairs(requested_pairs)
+
+    raise ValueError(f"Unsupported recording '{recording}'. Expected 'portalite' or 'semaxone'.")
+
+
+def _pick_device_sensor_channels(raw_obj, recording):
+    """Keep only the sensor channels requested for a specific device."""
+    if not raw_obj.filenames:
+        raise RuntimeError('Cannot resolve the SNIRF file for channel selection.')
+
+    sensor_pairs = _select_sensor_pairs_for_recording(raw_obj.filenames[0], recording)
+    selected_channels = []
+    for sensor_pair in sensor_pairs:
+        channel_prefix = f"S{sensor_pair['source_idx']}_D{sensor_pair['detector_idx']} "
+        selected_channels.extend(ch for ch in raw_obj.ch_names if ch.startswith(channel_prefix))
+
+    if not selected_channels:
+        raise RuntimeError(
+            f"No channels found for {recording} selected sensor pair(s)."
+        )
+
+    selected_channels = list(dict.fromkeys(selected_channels))
+    return raw_obj.copy().pick(selected_channels)
+
+
 # -----------------------------------------------------------------------------
-# 2) Chargement et pre-traitement des signaux
+# 2) Signal loading and preprocessing
 # -----------------------------------------------------------------------------
 def load_filtered_hb(subject, session, task, recording, base_root=None):
-    """Load SNIRF from BIDS, convert to Hb, then apply band-pass filtering."""
+    """Load SNIRF from BIDS, keep the device-specific sensor, convert to Hb, then filter."""
     if base_root is None:
         base_root = DEFAULT_BASE_ROOT
 
+    # Build the BIDS path that points to the requested SNIRF file.
     raw_path = BIDSPath(
         subject=subject,
         session=session,
@@ -146,9 +241,12 @@ def load_filtered_hb(subject, session, task, recording, base_root=None):
         datatype='nirs',
         root=base_root,
     )
+    # Read the raw optical signal, convert it to concentration, and filter it.
     raw_in = read_raw_bids(raw_path)
+    raw_in = _pick_device_sensor_channels(raw_in, recording)
     raw_od = mne.preprocessing.nirs.optical_density(raw_in)
     raw_hb = mne.preprocessing.nirs.beer_lambert_law(raw_od, ppf=4)
+    # Keep only the frequency band that is used by the analysis pipeline.
     return raw_hb.copy().filter(
         l_freq=0.01,
         h_freq=4,
@@ -159,11 +257,13 @@ def load_filtered_hb(subject, session, task, recording, base_root=None):
 
 def get_hbr_channels(raw_obj):
     """Return channel names corresponding to HbR signal."""
+    # Channel names usually encode the chromophore type in their label.
     return [ch for ch in raw_obj.ch_names if 'hbr' in ch.lower()]
 
 
 def get_hbo_channels(raw_obj):
     """Return channel names corresponding to HbO signal."""
+    # Reuse the same naming convention to isolate HbO channels.
     return [ch for ch in raw_obj.ch_names if 'hbo' in ch.lower()]
 
 
@@ -180,7 +280,7 @@ def _get_chromophore_channels(raw_obj, chromophore='HbR'):
 
 
 # -----------------------------------------------------------------------------
-# 3) Extraction de metriques HbR
+# 3) hbR metrics
 # -----------------------------------------------------------------------------
 def extract_hbr_means(
     raw_obj,
@@ -195,18 +295,22 @@ def extract_hbr_means(
     if window_duration is None:
         window_duration = DEFAULT_WINDOW_DURATION
 
+    # Convert selected channel names to integer indices in the raw data array.
     hbr_idx = [raw_obj.ch_names.index(ch) for ch in hbr_channels if ch in raw_obj.ch_names]
     if not hbr_idx:
         return []
 
     means = []
+    # Select only the requested trial type and use its onset times.
     trial_events = events_df.loc[events_df['trial_type'] == trial_type, 'onset']
     if verbose:
         print(f"\nProcessing {trial_type} series ({label})...")
 
     for onset in trial_events:
+        # Crop one fixed analysis window starting at the trial onset.
         segment = raw_obj.copy().crop(tmin=onset, tmax=onset + window_duration)
         data_array = segment.get_data()
+        # Average all HbR samples in the window and convert to micromolar.
         mean_hbr = np.mean(data_array[hbr_idx, :]) * 1e6
         means.append(mean_hbr)
         if verbose:
@@ -222,6 +326,7 @@ def compute_condition_hbr_average(raw_obj, events_df, trial_type, window_duratio
     1) For each series/event, compute mean across HbR channels and samples in the effort window.
     2) Condition average = arithmetic mean of all series means.
     """
+    # Reuse the lower-level extractor so the definition stays identical everywhere.
     hbr_channels = get_hbr_channels(raw_obj)
     series_means = extract_hbr_means(
         raw_obj,
@@ -245,13 +350,14 @@ def mean_std(values):
 
 
 # -----------------------------------------------------------------------------
-# 4) Visualisation
+# 4) Visualization
 # -----------------------------------------------------------------------------
 def plot_device(ax, x, means_pair, std_pair, series_pair, color_line, color_30, color_50, marker, label):
     """Plot 30/50% means, error bars, and individual series for one device."""
     if np.isnan(means_pair[0]) or np.isnan(means_pair[1]):
         return
-    ax.plot(x, means_pair, marker=marker, markersize=10, linewidth=2.5, color=color_line, label=label)
+    # Show mean markers only (no connecting segment between intensities).
+    ax.plot(x, means_pair, marker=marker, markersize=10, linestyle='None', color=color_line, label=label)
     ax.errorbar(x, means_pair, yerr=std_pair, fmt='none', ecolor=color_line, capsize=8, capthick=2, alpha=0.6)
     ax.scatter([30] * len(series_pair[0]), series_pair[0], alpha=0.3, s=60, color=color_30)
     ax.scatter([50] * len(series_pair[1]), series_pair[1], alpha=0.3, s=60, color=color_50)
@@ -268,7 +374,7 @@ def print_block(title, m30, s30, n30, m50, s50, n50):
 
 
 # -----------------------------------------------------------------------------
-# 6) Analyses comparatives et exports
+# 6) Comparative analyses and exports
 # -----------------------------------------------------------------------------
 def process_device(
     subject,
@@ -316,9 +422,11 @@ def process_device(
 
 def epoch_signal(raw_hb_filt, trial_type, t_pre=5, t_post=25, events_df=None, chromophore='HbR'):
     """Build baseline-corrected epochs around trial onsets for HbR, HbO, HbTot, or HbDiff."""
+    # Sampling frequency defines how many samples correspond to the requested time window.
     sfreq = raw_hb_filt.info['sfreq']
     chromophore_key = str(chromophore).strip().lower()
     if chromophore_key in {'hbtot', 'hbdiff'}:
+        # HbTot and HbDiff are derived from both HbO and HbR channels.
         hbo_chs = get_hbo_channels(raw_hb_filt)
         hbr_chs = get_hbr_channels(raw_hb_filt)
         if not hbo_chs or not hbr_chs:
@@ -327,19 +435,23 @@ def epoch_signal(raw_hb_filt, trial_type, t_pre=5, t_post=25, events_df=None, ch
         hbr_data_full = raw_hb_filt.get_data(picks=hbr_chs) * 1e6
         n_samples = min(hbo_data_full.shape[1], hbr_data_full.shape[1])
     else:
+        # For a single chromophore, only keep the matching channels.
         signal_chs = _get_chromophore_channels(raw_hb_filt, chromophore=chromophore)
         if not signal_chs:
             return np.array([]), np.array([])
         data_full = raw_hb_filt.get_data(picks=signal_chs) * 1e6
         n_samples = data_full.shape[1]
+    # Convert time windows into sample counts.
     n_pre = int(t_pre * sfreq)
     n_post    = int(t_post * sfreq)
     epochs    = []
 
     if events_df is not None:
+        # Prefer the events table when it is available because it already contains trial onsets.
         trial_events = events_df[events_df['trial_type'] == trial_type]
         onset_samples = [int(row['onset'] * sfreq) for _, row in trial_events.iterrows()]
     else:
+        # Fall back to annotations if the events TSV is not available.
         events, event_id = mne.events_from_annotations(raw_hb_filt, verbose=False)
         if trial_type not in event_id:
             return np.array([]), np.array([])
@@ -351,6 +463,7 @@ def epoch_signal(raw_hb_filt, trial_type, t_pre=5, t_post=25, events_df=None, ch
         start = onset_sample - n_pre
         stop = onset_sample + n_post
         if start < 0 or stop > n_samples:
+            # Skip epochs that would extend outside the available recording.
             continue
 
         if chromophore_key == 'hbtot':
@@ -360,6 +473,7 @@ def epoch_signal(raw_hb_filt, trial_type, t_pre=5, t_post=25, events_df=None, ch
         else:
             segment = np.mean(data_full[:, start:stop], axis=0)
 
+        # Remove the baseline so all epochs are aligned to the pre-trial reference level.
         n_baseline = int(2 * sfreq)
         baseline = np.median(segment[n_pre - n_baseline:n_pre])
         segment -= baseline
@@ -369,6 +483,7 @@ def epoch_signal(raw_hb_filt, trial_type, t_pre=5, t_post=25, events_df=None, ch
     if not epochs:
         return np.array([]), np.array([])
 
+    # Trim to the shortest epoch so the output array has a consistent length.
     min_len = min(e.shape[0] for e in epochs)
     epochs  = np.array([e[:min_len] for e in epochs])
     times   = np.linspace(-t_pre, t_post, min_len)
@@ -393,6 +508,7 @@ def plot_hb_envelope_and_auc_per_set(
     if base_root is None:
         base_root = DEFAULT_BASE_ROOT
 
+    # Normalize the recording input to a list so the loop below can treat one or many devices the same way.
     if isinstance(recording_choice, str):
         recordings = [recording_choice]
     else:
@@ -433,12 +549,14 @@ def plot_hb_envelope_and_auc_per_set(
         else:
             normalized_chromophores.append('HbDiff')
 
+    # Resolve the task name before touching the filesystem.
     task_used = infer_task_from_session(
         session_choice,
         task_choice=task_choice,
         subject_choice=subject_choice,
         base_root=base_root,
     )
+    # Events drive the set of displayable trial types and the epoch extraction step.
     events_file = build_events_file(base_root, subject_choice, session_choice, task_used)
     if not os.path.exists(events_file):
         raise FileNotFoundError(f'Events file not found: {events_file}')
@@ -446,6 +564,7 @@ def plot_hb_envelope_and_auc_per_set(
     events_df_selected = pd.read_csv(events_file, sep='\t')
     print(f'Using events file: {events_file}')
 
+    # Load every requested device up front so plotting and summary computation can reuse the same raw objects.
     raw_by_device = {}
     for dev in recordings:
         try:
@@ -462,6 +581,7 @@ def plot_hb_envelope_and_auc_per_set(
     if not raw_by_device:
         raise RuntimeError('No device could be loaded.')
 
+    # Only keep trial labels that are meant to be shown in analysis plots.
     trial_types = [
         t for t in sorted(events_df_selected['trial_type'].dropna().unique())
         if _is_displayable_trial_type(t)
@@ -474,6 +594,7 @@ def plot_hb_envelope_and_auc_per_set(
     summary = {}
 
     if plot_mode == 'combined':
+        # In combined mode, each row is a trial type and each column is a chromophore.
         fig, axes = plt.subplots(
             len(trial_types),
             len(normalized_chromophores),
@@ -490,6 +611,7 @@ def plot_hb_envelope_and_auc_per_set(
                 has_data = False
 
                 for dev, raw_selected in raw_by_device.items():
+                    # Build all epochs for this trial type, chromophore, and device.
                     epochs, times = epoch_signal(
                         raw_selected,
                         trial_type,
@@ -504,6 +626,7 @@ def plot_hb_envelope_and_auc_per_set(
                     has_data = True
                     mean_curve = np.mean(epochs, axis=0)
 
+                    # Use either standard deviation or min/max to build the visible envelope.
                     if envelope_mode == 'std':
                         std_curve = np.std(epochs, axis=0)
                         lower = mean_curve - std_curve
@@ -512,6 +635,7 @@ def plot_hb_envelope_and_auc_per_set(
                         lower = np.min(epochs, axis=0)
                         upper = np.max(epochs, axis=0)
 
+                    # Integrate only the portion of the curve that falls inside the requested AUC window.
                     auc_mask = times >= auc_tmin
                     if auc_tmax is not None:
                         auc_mask = auc_mask & (times <= auc_tmax)
@@ -546,6 +670,7 @@ def plot_hb_envelope_and_auc_per_set(
         plt.tight_layout()
         plt.show()
     else:
+        # In by-device mode, each figure is dedicated to one device.
         for dev, raw_selected in raw_by_device.items():
             fig, axes = plt.subplots(
                 len(trial_types),
@@ -564,6 +689,7 @@ def plot_hb_envelope_and_auc_per_set(
                     if chromophore not in summary[trial_type]:
                         summary[trial_type][chromophore] = {}
 
+                    # Reuse the same epoch extraction logic for each chromophore.
                     epochs, times = epoch_signal(
                         raw_selected,
                         trial_type,
@@ -578,6 +704,7 @@ def plot_hb_envelope_and_auc_per_set(
                     has_data = True
                     mean_curve = np.mean(epochs, axis=0)
 
+                    # The envelope shows dispersion across repeated sets.
                     if envelope_mode == 'std':
                         std_curve = np.std(epochs, axis=0)
                         lower = mean_curve - std_curve
@@ -586,6 +713,7 @@ def plot_hb_envelope_and_auc_per_set(
                         lower = np.min(epochs, axis=0)
                         upper = np.max(epochs, axis=0)
 
+                    # Compute one AUC per plotted mean curve so the legend carries the summary value.
                     auc_mask = times >= auc_tmin
                     if auc_tmax is not None:
                         auc_mask = auc_mask & (times <= auc_tmax)
@@ -628,15 +756,393 @@ def plot_hb_envelope_and_auc_per_set(
 
     return summary
 
+
+def plot_hbr_hbo_mean_and_auc_by_device(
+    subject_choice='001',
+    session_choice='002',
+    recording_choice=('semaxone', 'portalite'),
+    task_choice=None,
+    t_pre=5,
+    t_post=40,
+    auc_window=(0, None),
+    use_abs_envelope=False,
+    use_abs_auc=False,
+    auc_plot_style='bar',
+    base_root=None,
+):
+    """Plot HbR/HbO upper envelopes and AUC in separate figures, one set per device.
+
+    Figure 1 (per device): HbR and HbO analytic envelopes on the same axes.
+    If use_abs_envelope=True, the analytic envelope is computed from |signal|.
+    Figure 2 (per device): AUC as bars ('bar') or shaded area under each curve ('area').
+    """
+    if base_root is None:
+        base_root = DEFAULT_BASE_ROOT
+
+    if isinstance(recording_choice, str):
+        recordings = [recording_choice]
+    else:
+        recordings = list(recording_choice)
+
+    if not recordings:
+        raise ValueError('recording_choice must contain at least one device.')
+
+    if not isinstance(auc_window, (tuple, list)) or len(auc_window) != 2:
+        raise ValueError('auc_window must be a tuple/list: (t_start, t_end).')
+    auc_tmin, auc_tmax = auc_window
+
+    if auc_plot_style not in {'bar', 'area'}:
+        raise ValueError("auc_plot_style must be 'bar' or 'area'.")
+
+    chromophores = ['HbR', 'HbO']
+
+    task_used = infer_task_from_session(
+        session_choice,
+        task_choice=task_choice,
+        subject_choice=subject_choice,
+        base_root=base_root,
+    )
+    events_file = build_events_file(base_root, subject_choice, session_choice, task_used)
+    if not os.path.exists(events_file):
+        raise FileNotFoundError(f'Events file not found: {events_file}')
+
+    events_df_selected = pd.read_csv(events_file, sep='\t')
+    print(f'Using events file: {events_file}')
+
+    raw_by_device = {}
+    for dev in recordings:
+        try:
+            raw_by_device[dev] = load_filtered_hb(
+                subject_choice,
+                session_choice,
+                task_used,
+                dev,
+                base_root=base_root,
+            )
+        except Exception as e:
+            print(f"Warning: unable to load {dev}: {e}")
+
+    if not raw_by_device:
+        raise RuntimeError('No device could be loaded.')
+
+    trial_types = [
+        t for t in sorted(events_df_selected['trial_type'].dropna().unique())
+        if _is_displayable_trial_type(t)
+    ]
+    if not trial_types:
+        raise RuntimeError('No displayable trial_type found.')
+
+    envelope_payload = {}
+    auc_payload = {}
+
+    # Compute curves and AUC once, then reuse for all plots.
+    for trial_type in trial_types:
+        envelope_payload[trial_type] = {}
+        auc_payload[trial_type] = {}
+        for chromophore in chromophores:
+            envelope_payload[trial_type][chromophore] = {}
+            auc_payload[trial_type][chromophore] = {}
+            for dev, raw_selected in raw_by_device.items():
+                epochs, times = epoch_signal(
+                    raw_selected,
+                    trial_type,
+                    t_pre=t_pre,
+                    t_post=t_post,
+                    events_df=events_df_selected,
+                    chromophore=chromophore,
+                )
+                if len(epochs) == 0:
+                    continue
+
+                mean_curve = np.mean(epochs, axis=0)
+                signal_for_envelope = np.abs(mean_curve) if use_abs_envelope else mean_curve
+                analytic_signal = hilbert(signal_for_envelope)
+                amplitude_envelope = np.abs(analytic_signal)
+                auc_mask = times >= auc_tmin
+                if auc_tmax is not None:
+                    auc_mask = auc_mask & (times <= auc_tmax)
+
+                if np.any(auc_mask):
+                    auc_signal = np.abs(mean_curve[auc_mask]) if use_abs_auc else mean_curve[auc_mask]
+                    auc_value = _integrate_auc(auc_signal, times[auc_mask])
+                else:
+                    auc_value = np.nan
+
+                envelope_payload[trial_type][chromophore][dev] = {
+                    'times': times,
+                    'envelope': amplitude_envelope,
+                    'mean_for_auc': mean_curve,
+                }
+                auc_payload[trial_type][chromophore][dev] = auc_value
+
+    chromo_color = {'HbR': 'red', 'HbO': 'blue'}
+
+    # Figure 1: one analytic-envelope figure per device.
+    for dev in raw_by_device:
+        fig, axes = plt.subplots(
+            len(trial_types),
+            1,
+            figsize=(9.2, 3.8 * len(trial_types)),
+            squeeze=False,
+        )
+
+        for row_idx, trial_type in enumerate(trial_types):
+            ax = axes[row_idx, 0]
+            has_data = False
+
+            for chromophore in chromophores:
+                payload = envelope_payload[trial_type][chromophore].get(dev, None)
+                if payload is None:
+                    continue
+                has_data = True
+                color = chromo_color.get(chromophore, None)
+                ax.plot(
+                    payload['times'],
+                    payload['envelope'],
+                    color=color,
+                    linewidth=2.0,
+                    label=f"{chromophore} envelope",
+                )
+
+            _style_epoch_axis(
+                ax,
+                title=f"sub-{subject_choice} ses-{session_choice} | {dev} | {trial_type}",
+                ylabel='|ΔHb| (uM)' if use_abs_envelope else 'ΔHb (uM)',
+            )
+            if has_data:
+                _safe_legend(ax)
+            else:
+                ax.text(0.5, 0.5, 'No data', transform=ax.transAxes, ha='center', va='center', alpha=0.6)
+
+        fig.suptitle(f'HbR/HbO analytic envelopes - {dev}', fontsize=12, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+
+    # Figure 2: one AUC figure per device.
+    for dev in raw_by_device:
+        fig, axes = plt.subplots(
+            len(trial_types),
+            1,
+            figsize=(8.8, 3.8 * len(trial_types)),
+            squeeze=False,
+        )
+
+        for row_idx, trial_type in enumerate(trial_types):
+            ax = axes[row_idx, 0]
+            has_data = False
+
+            if auc_plot_style == 'bar':
+                x = np.arange(len(chromophores))
+                vals = [auc_payload[trial_type][ch].get(dev, np.nan) for ch in chromophores]
+
+                ax.bar(
+                    x,
+                    vals,
+                    width=0.55,
+                    color=[chromo_color.get(ch, 'gray') for ch in chromophores],
+                    alpha=0.85,
+                )
+                ax.axhline(0, color='gray', linestyle=':', linewidth=0.8, alpha=0.5)
+                ax.set_xticks(x)
+                ax.set_xticklabels(chromophores)
+                ax.set_ylabel('AUC (uM*s)')
+                ax.set_title(f"sub-{subject_choice} ses-{session_choice} | {dev} | {trial_type} | AUC")
+                ax.grid(True, axis='y', alpha=0.2)
+
+                if np.all(np.isnan(vals)):
+                    ax.text(0.5, 0.5, 'No AUC data', transform=ax.transAxes, ha='center', va='center', alpha=0.6)
+            else:
+                for chromophore in chromophores:
+                    payload = envelope_payload[trial_type][chromophore].get(dev, None)
+                    if payload is None:
+                        continue
+
+                    times = payload['times']
+                    mean_curve = payload['mean_for_auc']
+                    auc_mask = times >= auc_tmin
+                    if auc_tmax is not None:
+                        auc_mask = auc_mask & (times <= auc_tmax)
+                    if not np.any(auc_mask):
+                        continue
+
+                    has_data = True
+                    auc_curve = np.abs(mean_curve) if use_abs_auc else mean_curve
+                    auc_value = auc_payload[trial_type][chromophore].get(dev, np.nan)
+                    color = chromo_color.get(chromophore, 'gray')
+
+                    ax.plot(times, mean_curve, color=color, linewidth=1.8, label=f"{chromophore} mean")
+                    ax.fill_between(
+                        times[auc_mask],
+                        0,
+                        auc_curve[auc_mask],
+                        color=color,
+                        alpha=0.25,
+                        label=f"{chromophore} AUC={auc_value:.2f} uM*s",
+                    )
+
+                _style_epoch_axis(
+                    ax,
+                    title=f"sub-{subject_choice} ses-{session_choice} | {dev} | {trial_type} | AUC area",
+                    ylabel='ΔHb (uM)',
+                )
+                if has_data:
+                    _safe_legend(ax)
+                else:
+                    ax.text(0.5, 0.5, 'No AUC data', transform=ax.transAxes, ha='center', va='center', alpha=0.6)
+
+        fig.suptitle(f'HbR/HbO AUC - {dev} ({auc_plot_style})', fontsize=12, fontweight='bold')
+        plt.tight_layout()
+        plt.show()
+
+    return auc_payload
+
+
+def plot_concentric_vs_eccentric_envelopes(
+    subject_choice='001',
+    recording_choice=('semaxone', 'portalite'),
+    t_pre=5,
+    t_post=40,
+    chromophore='HbR',
+    use_abs_envelope=True,
+    base_root=None,
+):
+    """Compare concentric vs eccentric envelopes for 30% and 50% for one subject.
+
+    One figure is produced per device. Each figure contains 2 subplots:
+    - intensity 30%: Con30 vs Ecc30
+    - intensity 50%: Con50 vs Ecc50
+    """
+    if base_root is None:
+        base_root = DEFAULT_BASE_ROOT
+
+    if isinstance(recording_choice, str):
+        recordings = [recording_choice]
+    else:
+        recordings = list(recording_choice)
+
+    if not recordings:
+        raise ValueError('recording_choice must contain at least one device.')
+
+    chromo_key = str(chromophore).strip().lower()
+    if chromo_key == 'hbr':
+        chromophore = 'HbR'
+    elif chromo_key == 'hbo':
+        chromophore = 'HbO'
+    else:
+        raise ValueError("chromophore must be 'HbR' or 'HbO'.")
+
+    task_to_session_events = {}
+    for task_name in ['concentric', 'eccentric']:
+        found = _find_first_session_for_task(base_root, subject_choice, task_name)
+        if found is None:
+            raise FileNotFoundError(
+                f"No events file found for task '{task_name}' and subject {subject_choice}."
+            )
+        session_id, events_file = found
+        task_to_session_events[task_name] = {
+            'session': session_id,
+            'events_df': pd.read_csv(events_file, sep='\t'),
+        }
+
+    trial_map = {
+        30: {'concentric': 'Con30', 'eccentric': 'Ecc30'},
+        50: {'concentric': 'Con50', 'eccentric': 'Ecc50'},
+    }
+    # Use task-specific colors that do not overlap with HbR/HbO red/blue convention.
+    task_colors = {'concentric': '#2E8B57', 'eccentric': '#E67E22'}
+    summary = {}
+
+    for dev in recordings:
+        fig, axes = plt.subplots(1, 2, figsize=(14.5, 4.8), squeeze=False)
+        fig_axes = axes[0]
+        summary[dev] = {}
+
+        for col_idx, intensity in enumerate([30, 50]):
+            ax = fig_axes[col_idx]
+            summary[dev][intensity] = {}
+            has_data = False
+
+            for task_name in ['concentric', 'eccentric']:
+                session_id = task_to_session_events[task_name]['session']
+                events_df = task_to_session_events[task_name]['events_df']
+                trial_type = trial_map[intensity][task_name]
+
+                try:
+                    raw_selected = load_filtered_hb(
+                        subject=subject_choice,
+                        session=session_id,
+                        task=task_name,
+                        recording=dev,
+                        base_root=base_root,
+                    )
+                except Exception as e:
+                    print(
+                        f"Warning: unable to load {dev} for {task_name} "
+                        f"(sub-{subject_choice} ses-{session_id}): {e}"
+                    )
+                    continue
+
+                epochs, times = epoch_signal(
+                    raw_selected,
+                    trial_type,
+                    t_pre=t_pre,
+                    t_post=t_post,
+                    events_df=events_df,
+                    chromophore=chromophore,
+                )
+                if len(epochs) == 0:
+                    continue
+
+                has_data = True
+                mean_curve = np.mean(epochs, axis=0)
+                # Hilbert envelope is the analytic signal amplitude (always non-negative).
+                signal_for_env = np.abs(mean_curve) if use_abs_envelope else mean_curve
+                envelope = np.abs(hilbert(signal_for_env))
+
+                ax.plot(
+                    times,
+                    envelope,
+                    color=task_colors[task_name],
+                    linewidth=2.0,
+                    label=f"{task_name.capitalize()} ({trial_type}, n={len(epochs)})",
+                )
+
+                summary[dev][intensity][task_name] = {
+                    'session': session_id,
+                    'trial_type': trial_type,
+                    'n_sets': int(len(epochs)),
+                }
+
+            _style_epoch_axis(
+                ax,
+                title=f"sub-{subject_choice} | {dev} | {intensity}%",
+                ylabel='ΔHHb (uM)' if use_abs_envelope else 'ΔHHb (uM)',
+            )
+
+            if has_data:
+                _safe_legend(ax)
+            else:
+                ax.text(0.5, 0.5, 'No data', transform=ax.transAxes, ha='center', va='center', alpha=0.6)
+
+        fig.suptitle(
+            f"{chromophore} envelope comparison: Concentric vs Eccentric - {dev}",
+            fontsize=12,
+            fontweight='bold',
+        )
+        plt.tight_layout()
+        plt.show()
+
+    return summary
+
 def plot_temporal_comparison(results):
-    """Plot each temporal series separately for mode/intensity/device comparisons."""
-    modes = [('Con', 'Concentrique'), ('Ecc', 'Excentrique')]
+    """Plot each temporal series separately for concentric and eccentric comparisons."""
+    modes = [('Con', 'Concentric'), ('Ecc', 'Eccentric')]
 
     for mode, mode_label in modes:
         for intensity in ['30', '50']:
             key = f'{mode}{intensity}'
 
-            # Vérifie qu'au moins un appareil est disponible
+            # Keep only devices that are present in the results dictionary.
             data = {
                 dev: results[f'{key}_{dev}']
                 for dev in ['semaxone', 'portalite']
@@ -645,10 +1151,10 @@ def plot_temporal_comparison(results):
             if not data:
                 continue
 
-            # Nombre de séries = max entre les appareils
+            # Use the largest series count so every available trace gets a figure.
             n = max(len(d['epochs']) for d in data.values())
 
-            # Affiche chaque série dans une figure séparée (une par une)
+            # Draw one figure per series so devices can be compared trace by trace.
             for i in range(n):
                 fig, ax = plt.subplots(1, 1, figsize=(5, 4), sharey=True)
                 for dev, d in data.items():
@@ -659,7 +1165,7 @@ def plot_temporal_comparison(results):
 
                 _style_epoch_axis(
                     ax,
-                    title=f'{mode_label} — {intensity}% — Série {i + 1}',
+                    title=f'{mode_label} — {intensity}% — Series {i + 1}',
                     ylabel='ΔHbR (µM)',
                 )
                 _safe_legend(ax)
@@ -703,7 +1209,7 @@ def extract_temporal_features(epochs, times, t_effort_end=30):
 
 
 # -----------------------------------------------------------------------------
-# 5) Logique de mapping task/session
+# 5) Task/session mapping logic
 # -----------------------------------------------------------------------------
 def infer_task_from_session(
     session_choice,
@@ -713,9 +1219,11 @@ def infer_task_from_session(
 ):
     """Infer task from explicit input, events files, or default session mapping."""
     if task_choice is not None:
+        # Explicit user input always wins.
         return task_choice
 
     # Prefer explicit discovery from existing events files for this subject/session.
+    # This avoids relying on the default session-to-task mapping when the data already says otherwise.
     if subject_choice is not None and base_root is not None:
         nirs_dir = os.path.join(
             base_root,
@@ -729,6 +1237,7 @@ def infer_task_from_session(
             tasks = []
             for fname in os.listdir(nirs_dir):
                 if fname.startswith(prefix) and fname.endswith(suffix):
+                    # Extract the task name from each matching events filename.
                     tasks.append(fname[len(prefix):-len(suffix)])
 
             unique_tasks = sorted(set(tasks))
@@ -741,6 +1250,7 @@ def infer_task_from_session(
                 )
 
     session_task_map = {'001': 'concentric', '002': 'eccentric'}
+    # Fall back to the legacy session-to-task convention when no file-based match exists.
     task_used = session_task_map.get(session_choice)
     if task_used is None:
         raise ValueError(
@@ -751,6 +1261,7 @@ def infer_task_from_session(
 
 def build_events_file(base_root, subject_choice, session_choice, task_used):
     """Build path to NIRS events TSV for selected subject/session/task."""
+    # This is the canonical BIDS-style path used throughout the module.
     return os.path.join(
         base_root,
         f'sub-{subject_choice}',
@@ -785,7 +1296,7 @@ def _plot_epochs_one_by_one(
 
         _style_epoch_axis(
             ax,
-            title=f"sub-{subject_choice} ses-{session_choice} | {trial_type} | Serie {idx + 1}",
+            title=f"sub-{subject_choice} ses-{session_choice} | {trial_type} | Series {idx + 1}",
         )
         _safe_legend(ax)
         plt.tight_layout()
@@ -836,7 +1347,7 @@ def _plot_intensity_per_row(trial_data, subject_choice, session_choice):
             _style_epoch_axis(ax)
 
             if row_idx == 0:
-                ax.set_title(f'Serie {col_idx + 1}', fontsize=10)
+                ax.set_title(f'Series {col_idx + 1}', fontsize=10)
 
             if col_idx == 0:
                 ax.set_ylabel(f'{trial_type}\nΔHbR (uM)')
@@ -872,6 +1383,7 @@ def plot_envelope_and_auc_per_set(
     if base_root is None:
         base_root = DEFAULT_BASE_ROOT
 
+    # Normalize the recording argument so downstream code can loop over a simple list.
     if isinstance(recording_choice, str):
         recordings = [recording_choice]
     else:
@@ -887,6 +1399,7 @@ def plot_envelope_and_auc_per_set(
         raise ValueError('auc_window must be a tuple/list: (t_start, t_end).')
     auc_tmin, auc_tmax = auc_window
 
+    # Resolve the task first so the events file and the raw SNIRF file stay aligned.
     task_used = infer_task_from_session(
         session_choice,
         task_choice=task_choice,
@@ -900,6 +1413,7 @@ def plot_envelope_and_auc_per_set(
     events_df_selected = pd.read_csv(events_file, sep='\t')
     print(f'Using events file: {events_file}')
 
+    # Load all requested recordings once and reuse the raw objects for every trial type.
     raw_by_device = {}
     for dev in recordings:
         try:
@@ -916,6 +1430,7 @@ def plot_envelope_and_auc_per_set(
     if not raw_by_device:
         raise RuntimeError('No device could be loaded.')
 
+    # Ignore non-displayable trial labels such as MVC and occlusion markers.
     trial_types = [
         t for t in sorted(events_df_selected['trial_type'].dropna().unique())
         if _is_displayable_trial_type(t)
@@ -934,6 +1449,7 @@ def plot_envelope_and_auc_per_set(
         has_data = False
 
         for dev, raw_selected in raw_by_device.items():
+            # Extract epochs once per device so the mean curve and envelope use the same data.
             epochs, times = epoch_signal(
                 raw_selected,
                 trial_type,
@@ -947,6 +1463,7 @@ def plot_envelope_and_auc_per_set(
             has_data = True
             mean_curve = np.mean(epochs, axis=0)
 
+            # Choose how to visualize dispersion across repeated trials.
             if envelope_mode == 'std':
                 std_curve = np.std(epochs, axis=0)
                 lower = mean_curve - std_curve
@@ -955,6 +1472,7 @@ def plot_envelope_and_auc_per_set(
                 lower = np.min(epochs, axis=0)
                 upper = np.max(epochs, axis=0)
 
+            # Restrict the integration to the requested time range before computing AUC.
             auc_mask = times >= auc_tmin
             if auc_tmax is not None:
                 auc_mask = auc_mask & (times <= auc_tmax)
@@ -1147,7 +1665,7 @@ def compare_devices_by_task(
     con_sem, con_port = _process_task_for_devices('concentric')
     ecc_sem, ecc_port = _process_task_for_devices('eccentric')
 
-    # Keep legacy variable names for downstream notebook cells.
+    # Keep legacy variable names because downstream notebook cells may already reference them.
     hbr_con30_sem_means, hbr_con50_sem_means = con_sem['means30'], con_sem['means50']
     mean_hbr_con30_sem, std_hbr_con30_sem = con_sem['mean30'], con_sem['std30']
     mean_hbr_con50_sem, std_hbr_con50_sem = con_sem['mean50'], con_sem['std50']
@@ -1167,7 +1685,7 @@ def compare_devices_by_task(
     mean_hbr_ecc50_port, std_hbr_ecc50_port = ecc_port['mean50'], ecc_port['std50']
     eccentric_portalite_available = ecc_port['available']
 
-    # Plot
+    # Plot the per-device comparison when requested.
     if make_plot:
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(16, 6))
 
@@ -1250,7 +1768,7 @@ def compare_devices_by_task(
         plt.tight_layout()
         plt.show()
 
-    # Statistics
+    # Print the per-device summary statistics when requested.
     if print_stats:
         print(f"\n{'=' * 70}")
         print('STATISTICS - HbR concentration comparison by device')
@@ -1417,9 +1935,8 @@ def _iter_subject_session_task_events(base_root, subject_ids=None):
 
 
 def _default_output_dir_from_base_root(base_root):
-    """Compute default Analysis_Results folder from BIDS base root."""
-    project_root = os.path.dirname(os.path.dirname(base_root))
-    return os.path.join(project_root, 'Analysis_Results')
+    """Return the fixed Analysis_Results folder used by this project."""
+    return DEFAULT_ANALYSIS_RESULTS_DIR
 
 
 def _is_displayable_trial_type(trial_type):
@@ -1452,6 +1969,7 @@ def build_hbr_summary_table(
 
     rows = []
 
+    # Walk through every available subject/session/task events file.
     for subject_id, session_id, task_name, events_file in _iter_subject_session_task_events(
         base_root,
         subject_ids=subject_ids,
@@ -1466,6 +1984,7 @@ def build_hbr_summary_table(
             print(f"Processing sub-{subject_id} ses-{session_id} task-{task_name} ({recording})")
 
         try:
+            # Read the events table and load the corresponding filtered Hb data.
             events_df = pd.read_csv(events_file, sep='\t')
             raw_hb_filt = load_filtered_hb(
                 subject=subject_id,
@@ -1482,6 +2001,7 @@ def build_hbr_summary_table(
                 continue
 
             for intensity in ['30', '50']:
+                # Compute one value per intensity so the summary table stays compact.
                 trial_type = trial_map[task_key][intensity]
                 means = extract_hbr_means(
                     raw_hb_filt,
@@ -1534,9 +2054,10 @@ def export_hbr_summary_csv(
     """Export CSV with HbR summary rows: Subject, Session, Task, mode, intensity, mean, std, n."""
     if base_root is None:
         base_root = DEFAULT_BASE_ROOT
-    if output_dir is None:
-        output_dir = _default_output_dir_from_base_root(base_root)
+    # Always write exports to the project Analysis_Results folder.
+    output_dir = _default_output_dir_from_base_root(base_root)
 
+    # Build the table first so we can skip file creation when there is no data.
     results_df = build_hbr_summary_table(
         subject_ids=subject_ids,
         base_root=base_root,
@@ -1554,19 +2075,13 @@ def export_hbr_summary_csv(
     output_path = os.path.join(output_dir, output_filename)
 
     try:
+        # Use a semicolon-separated CSV because the downstream workflow expects that format.
         results_df.to_csv(output_path, index=False, sep=';', decimal=',')
     except PermissionError:
-        fallback_dir = os.path.join(
-            os.path.expanduser('~'),
-            'Documents',
-            'DigiMove',
-            'Analysis_Results',
+        raise PermissionError(
+            f"Cannot write CSV to {output_path}. "
+            "Close the file if it is open and check write permissions for Analysis_Results."
         )
-        os.makedirs(fallback_dir, exist_ok=True)
-        output_path = os.path.join(fallback_dir, output_filename)
-        results_df.to_csv(output_path, index=False, sep=';', decimal=',')
-        if print_progress:
-            print('No write permission in target folder. Saved to fallback path.')
 
     if print_progress:
         print(f"\n{'=' * 70}")
@@ -1593,10 +2108,12 @@ def _extract_window_means_by_chromophore(
     onsets = events_df.loc[events_df['trial_type'] == trial_type, 'onset']
     means = []
 
+    # Cache the chromophore-specific channel lists once per call.
     hbr_chs = get_hbr_channels(raw_obj)
     hbo_chs = get_hbo_channels(raw_obj)
 
     for onset in onsets:
+        # Crop the window once and then compute each derived metric from the same segment.
         segment = raw_obj.copy().crop(tmin=onset, tmax=onset + window_duration)
 
         if chromophore == 'HbR':
@@ -1646,6 +2163,7 @@ def build_hb_summary_table(
     rows = []
 
     def _append_empty_row(subject_id, session_id, task_key, intensity):
+        # Keep the table rectangular even when data is missing for one condition.
         rows.append(
             {
                 'Subject': subject_id,
@@ -1671,6 +2189,7 @@ def build_hb_summary_table(
             print(f"Processing sub-{subject_id} ses-{session_id} task-{task_name} ({recording})")
 
         try:
+            # Load the raw file directly so we can skip sessions where the SNIRF file is absent.
             raw_path = BIDSPath(
                 subject=subject_id,
                 session=session_id,
@@ -1686,6 +2205,7 @@ def build_hb_summary_table(
                 if print_progress:
                     print(f"  Missing raw file: {raw_path.fpath}")
                 if include_all_participants:
+                    # Write placeholder rows so downstream stats can still align subjects.
                     for intensity in ['30', '50']:
                         _append_empty_row(subject_id, session_id, task_key, intensity)
                 continue
@@ -1700,6 +2220,7 @@ def build_hb_summary_table(
             )
 
             for intensity in ['30', '50']:
+                # Derive all chromophore summaries from the same set of event windows.
                 trial_type = trial_map[task_key][intensity]
 
                 hbr_vals = _extract_window_means_by_chromophore(
@@ -1746,6 +2267,238 @@ def build_hb_summary_table(
     return pd.DataFrame(rows)
 
 
+def _extract_intensity_from_trial_type(trial_type):
+    """Extract intensity label from trial type, e.g., Con30 -> 30%."""
+    trial_text = str(trial_type).strip()
+    digits = ''.join(ch for ch in trial_text if ch.isdigit())
+    if not digits:
+        return 'NA'
+    return f'{digits}%'
+
+
+def _compute_trial_chromophore_metrics(
+    raw_obj,
+    onset,
+    window_duration,
+    chromophore,
+    use_abs_envelope=True,
+    use_abs_auc=True,
+):
+    """Compute mean, envelope metrics, and AUC for one trial window and one chromophore."""
+    if window_duration is None:
+        window_duration = DEFAULT_WINDOW_DURATION
+
+    hbr_chs = get_hbr_channels(raw_obj)
+    hbo_chs = get_hbo_channels(raw_obj)
+    segment = raw_obj.copy().crop(tmin=onset, tmax=onset + window_duration)
+
+    if chromophore == 'HbR':
+        if not hbr_chs:
+            return None
+        data = segment.get_data(picks=hbr_chs) * 1e6
+        mean_curve = np.mean(data, axis=0)
+    elif chromophore == 'HbO':
+        if not hbo_chs:
+            return None
+        data = segment.get_data(picks=hbo_chs) * 1e6
+        mean_curve = np.mean(data, axis=0)
+    elif chromophore in {'HbDiff', 'HbTot'}:
+        if not hbo_chs or not hbr_chs:
+            return None
+        data_hbo = segment.get_data(picks=hbo_chs) * 1e6
+        data_hbr = segment.get_data(picks=hbr_chs) * 1e6
+        mean_hbo_curve = np.mean(data_hbo, axis=0)
+        mean_hbr_curve = np.mean(data_hbr, axis=0)
+        if chromophore == 'HbDiff':
+            mean_curve = mean_hbo_curve - mean_hbr_curve
+        else:
+            mean_curve = mean_hbo_curve + mean_hbr_curve
+    else:
+        raise ValueError("chromophore must be one of: HbR, HbO, HbDiff, HbTot")
+
+    if mean_curve.size == 0:
+        return None
+
+    envelope_signal = np.abs(mean_curve) if use_abs_envelope else mean_curve
+    envelope = np.abs(hilbert(envelope_signal))
+
+    auc_signal = np.abs(mean_curve) if use_abs_auc else mean_curve
+    times = segment.times
+    if auc_signal.size >= 2 and times.size >= 2:
+        auc_value = _integrate_auc(auc_signal, times)
+    else:
+        auc_value = np.nan
+
+    return {
+        'mean_uM': float(np.mean(mean_curve)),
+        'envelope_peak_uM': float(np.max(envelope)),
+        'envelope_mean_uM': float(np.mean(envelope)),
+        'auc_uM_s': float(auc_value) if np.isfinite(auc_value) else np.nan,
+    }
+
+
+def build_hb_trial_table(
+    subject_ids=None,
+    base_root=None,
+    recording='portalite',
+    window_duration=None,
+    include_all_participants=False,
+    use_abs_envelope=True,
+    use_abs_auc=True,
+    print_progress=True,
+):
+    """Build one row per trial with Hb means, envelope, and AUC for one device."""
+    if base_root is None:
+        base_root = DEFAULT_BASE_ROOT
+
+    rows = []
+
+    for subject_id, session_id, task_name, events_file in _iter_subject_session_task_events(
+        base_root,
+        subject_ids=subject_ids,
+    ):
+        if print_progress:
+            print(f"Processing sub-{subject_id} ses-{session_id} task-{task_name} ({recording})")
+
+        try:
+            raw_path = BIDSPath(
+                subject=subject_id,
+                session=session_id,
+                task=task_name,
+                recording=recording,
+                suffix='nirs',
+                extension='.snirf',
+                datatype='nirs',
+                root=base_root,
+            )
+
+            if not os.path.exists(raw_path.fpath):
+                if print_progress:
+                    print(f"  Missing raw file: {raw_path.fpath}")
+                continue
+
+            events_df = pd.read_csv(events_file, sep='\t')
+            raw_hb_filt = load_filtered_hb(
+                subject=subject_id,
+                session=session_id,
+                task=task_name,
+                recording=recording,
+                base_root=base_root,
+            )
+
+            event_rows = events_df.copy()
+            event_rows = event_rows[event_rows['trial_type'].map(_is_displayable_trial_type)]
+
+            if event_rows.empty:
+                if include_all_participants:
+                    rows.append(
+                        {
+                            'Subject': subject_id,
+                            'Session': session_id,
+                            'Task': task_name,
+                            'Contraction_Mode': task_name.capitalize(),
+                            'Recording': recording,
+                            'Trial_Type': 'NA',
+                            'Trial_Index': np.nan,
+                            'Onset_s': np.nan,
+                            'Intensity': 'NA',
+                            'Mean_HbR_uM': np.nan,
+                            'Mean_HbO_uM': np.nan,
+                            'Mean_HbDiff_uM': np.nan,
+                            'Mean_HbTot_uM': np.nan,
+                            'EnvelopePeak_HbR_uM': np.nan,
+                            'EnvelopePeak_HbO_uM': np.nan,
+                            'EnvelopePeak_HbDiff_uM': np.nan,
+                            'EnvelopePeak_HbTot_uM': np.nan,
+                            'EnvelopeMean_HbR_uM': np.nan,
+                            'EnvelopeMean_HbO_uM': np.nan,
+                            'EnvelopeMean_HbDiff_uM': np.nan,
+                            'EnvelopeMean_HbTot_uM': np.nan,
+                            'AUC_HbR_uM_s': np.nan,
+                            'AUC_HbO_uM_s': np.nan,
+                            'AUC_HbDiff_uM_s': np.nan,
+                            'AUC_HbTot_uM_s': np.nan,
+                        }
+                    )
+                continue
+
+            trial_counters = {}
+            for _, event_row in event_rows.iterrows():
+                trial_type = str(event_row['trial_type']).strip()
+                onset = float(event_row['onset'])
+                trial_index = trial_counters.get(trial_type, 0) + 1
+                trial_counters[trial_type] = trial_index
+
+                hbr_metrics = _compute_trial_chromophore_metrics(
+                    raw_hb_filt,
+                    onset,
+                    window_duration,
+                    'HbR',
+                    use_abs_envelope=use_abs_envelope,
+                    use_abs_auc=use_abs_auc,
+                )
+                hbo_metrics = _compute_trial_chromophore_metrics(
+                    raw_hb_filt,
+                    onset,
+                    window_duration,
+                    'HbO',
+                    use_abs_envelope=use_abs_envelope,
+                    use_abs_auc=use_abs_auc,
+                )
+                hbdiff_metrics = _compute_trial_chromophore_metrics(
+                    raw_hb_filt,
+                    onset,
+                    window_duration,
+                    'HbDiff',
+                    use_abs_envelope=use_abs_envelope,
+                    use_abs_auc=use_abs_auc,
+                )
+                hbtot_metrics = _compute_trial_chromophore_metrics(
+                    raw_hb_filt,
+                    onset,
+                    window_duration,
+                    'HbTot',
+                    use_abs_envelope=use_abs_envelope,
+                    use_abs_auc=use_abs_auc,
+                )
+
+                rows.append(
+                    {
+                        'Subject': subject_id,
+                        'Session': session_id,
+                        'Task': task_name,
+                        'Contraction_Mode': task_name.capitalize(),
+                        'Recording': recording,
+                        'Trial_Type': trial_type,
+                        'Trial_Index': trial_index,
+                        'Onset_s': onset,
+                        'Intensity': _extract_intensity_from_trial_type(trial_type),
+                        'Mean_HbR_uM': np.nan if hbr_metrics is None else hbr_metrics['mean_uM'],
+                        'Mean_HbO_uM': np.nan if hbo_metrics is None else hbo_metrics['mean_uM'],
+                        'Mean_HbDiff_uM': np.nan if hbdiff_metrics is None else hbdiff_metrics['mean_uM'],
+                        'Mean_HbTot_uM': np.nan if hbtot_metrics is None else hbtot_metrics['mean_uM'],
+                        'EnvelopePeak_HbR_uM': np.nan if hbr_metrics is None else hbr_metrics['envelope_peak_uM'],
+                        'EnvelopePeak_HbO_uM': np.nan if hbo_metrics is None else hbo_metrics['envelope_peak_uM'],
+                        'EnvelopePeak_HbDiff_uM': np.nan if hbdiff_metrics is None else hbdiff_metrics['envelope_peak_uM'],
+                        'EnvelopePeak_HbTot_uM': np.nan if hbtot_metrics is None else hbtot_metrics['envelope_peak_uM'],
+                        'EnvelopeMean_HbR_uM': np.nan if hbr_metrics is None else hbr_metrics['envelope_mean_uM'],
+                        'EnvelopeMean_HbO_uM': np.nan if hbo_metrics is None else hbo_metrics['envelope_mean_uM'],
+                        'EnvelopeMean_HbDiff_uM': np.nan if hbdiff_metrics is None else hbdiff_metrics['envelope_mean_uM'],
+                        'EnvelopeMean_HbTot_uM': np.nan if hbtot_metrics is None else hbtot_metrics['envelope_mean_uM'],
+                        'AUC_HbR_uM_s': np.nan if hbr_metrics is None else hbr_metrics['auc_uM_s'],
+                        'AUC_HbO_uM_s': np.nan if hbo_metrics is None else hbo_metrics['auc_uM_s'],
+                        'AUC_HbDiff_uM_s': np.nan if hbdiff_metrics is None else hbdiff_metrics['auc_uM_s'],
+                        'AUC_HbTot_uM_s': np.nan if hbtot_metrics is None else hbtot_metrics['auc_uM_s'],
+                    }
+                )
+
+        except Exception as e:
+            if print_progress:
+                print(f"  Error for sub-{subject_id} ses-{session_id} task-{task_name}: {e}")
+
+    return pd.DataFrame(rows)
+
+
 def export_hb_summary_csv_by_device(
     subject_ids=None,
     base_root=None,
@@ -1754,13 +2507,21 @@ def export_hb_summary_csv_by_device(
     output_dir=None,
     filename_prefix='hb_summary',
     include_all_participants=False,
+    table_granularity='trial',
+    use_abs_envelope=True,
+    use_abs_auc=True,
     print_progress=True,
 ):
-    """Export two CSV tables (one per device) with mean HbR/HbO/HbDiff/HbTot."""
+    """Export one CSV per device in summary or per-trial granularity.
+
+    table_granularity:
+        - 'trial' (default): one row per trial with mean, envelope, and AUC metrics.
+        - 'summary': one row per intensity with mean chromophore values.
+    """
     if base_root is None:
         base_root = DEFAULT_BASE_ROOT
-    if output_dir is None:
-        output_dir = _default_output_dir_from_base_root(base_root)
+    # Always write exports to the project Analysis_Results folder.
+    output_dir = _default_output_dir_from_base_root(base_root)
     if recordings is None:
         recordings = ['portalite', 'semaxone']
 
@@ -1768,19 +2529,40 @@ def export_hb_summary_csv_by_device(
 
     results = {}
     for recording in recordings:
-        df = build_hb_summary_table(
-            subject_ids=subject_ids,
-            base_root=base_root,
-            recording=recording,
-            window_duration=window_duration,
-            include_all_participants=include_all_participants,
-            print_progress=print_progress,
-        )
+        # Build one table per device so device-specific trends remain separated.
+        if table_granularity == 'trial':
+            df = build_hb_trial_table(
+                subject_ids=subject_ids,
+                base_root=base_root,
+                recording=recording,
+                window_duration=window_duration,
+                include_all_participants=include_all_participants,
+                use_abs_envelope=use_abs_envelope,
+                use_abs_auc=use_abs_auc,
+                print_progress=print_progress,
+            )
+        elif table_granularity == 'summary':
+            df = build_hb_summary_table(
+                subject_ids=subject_ids,
+                base_root=base_root,
+                recording=recording,
+                window_duration=window_duration,
+                include_all_participants=include_all_participants,
+                print_progress=print_progress,
+            )
+        else:
+            raise ValueError("table_granularity must be 'trial' or 'summary'.")
 
         output_path = None
         if not df.empty:
             output_path = os.path.join(output_dir, f'{filename_prefix}_{recording}.csv')
-            df.to_csv(output_path, index=False, sep=';', decimal=',')
+            try:
+                df.to_csv(output_path, index=False, sep=';', decimal=',')
+            except PermissionError:
+                raise PermissionError(
+                    f"Cannot write CSV to {output_path}. "
+                    "Close the file if it is open and check write permissions for Analysis_Results."
+                )
 
         results[recording] = {
             'results_df': df,
@@ -1890,29 +2672,31 @@ def compare_devices_group_mean(
             x,
             [mean_hbr_con30_sem, mean_hbr_con50_sem],
             yerr=[std_hbr_con30_sem, std_hbr_con50_sem],
-            fmt='-o',
+            fmt='o',
             marker='o',
             markersize=9,
-            linewidth=2.5,
-            color='pink',
+            linestyle='None',
+            color='purple',
             label='Semaxone',
+            elinewidth=2,
             capsize=7,
         )
         ax1.errorbar(
             x,
             [mean_hbr_con30_port, mean_hbr_con50_port],
             yerr=[std_hbr_con30_port, std_hbr_con50_port],
-            fmt='-s',
+            fmt='s',
             marker='s',
             markersize=9,
-            linewidth=2.5,
-            color='yellow',
+            linestyle='None',
+            color='green',
             label='Portalite',
+            elinewidth=2,
             capsize=7,
         )
         ax1.set_xlabel('Intensity', fontsize=13, fontweight='bold')
-        ax1.set_ylabel('HbR Concentration (uM)', fontsize=13, fontweight='bold')
-        ax1.set_title('HbR Group Mean - Concentric (all subjects)', fontsize=14, fontweight='bold')
+        ax1.set_ylabel('HHb Concentration (uM)', fontsize=13, fontweight='bold')
+        ax1.set_title('HHb Group Mean - Concentric (all subjects)', fontsize=14, fontweight='bold')
         ax1.set_xticks(x)
         ax1.set_xticklabels(['30%', '50%'])
         ax1.legend(loc='best')
@@ -1922,29 +2706,31 @@ def compare_devices_group_mean(
             x,
             [mean_hbr_ecc30_sem, mean_hbr_ecc50_sem],
             yerr=[std_hbr_ecc30_sem, std_hbr_ecc50_sem],
-            fmt='-o',
+            fmt='o',
             marker='o',
             markersize=9,
-            linewidth=2.5,
-            color='pink',
+            linestyle='None',
+            color='purple',
             label='Semaxone',
+            elinewidth=2,
             capsize=7,
         )
         ax2.errorbar(
             x,
             [mean_hbr_ecc30_port, mean_hbr_ecc50_port],
             yerr=[std_hbr_ecc30_port, std_hbr_ecc50_port],
-            fmt='-s',
+            fmt='s',
             marker='s',
             markersize=9,
-            linewidth=2.5,
-            color='yellow',
+            linestyle='None',
+            color='green',
             label='Portalite',
+            elinewidth=2,
             capsize=7,
         )
         ax2.set_xlabel('Intensity', fontsize=13, fontweight='bold')
-        ax2.set_ylabel('HbR Concentration (uM)', fontsize=13, fontweight='bold')
-        ax2.set_title('HbR Group Mean - Eccentric (all subjects)', fontsize=14, fontweight='bold')
+        ax2.set_ylabel('HHb Concentration (uM)', fontsize=13, fontweight='bold')
+        ax2.set_title('HHb Group Mean - Eccentric (all subjects)', fontsize=14, fontweight='bold')
         ax2.set_xticks(x)
         ax2.set_xticklabels(['30%', '50%'])
         ax2.legend(loc='best')
@@ -1964,7 +2750,7 @@ def compare_devices_group_mean(
         subject_ids_used = sorted(all_subject_stats.keys())
         print(f"Subjects used for group mean: {subject_ids_used}")
         print(f"\n{'=' * 70}")
-        print('GROUP STATISTICS - HbR mean across subjects')
+        print('DESCRIPTIVE GROUP STATISTICS - HHb mean across subjects')
         print(f"{'=' * 70}")
         print(
             f"CONCENTRIC - SEMAXONE: 30%={mean_hbr_con30_sem:.3f}+-{std_hbr_con30_sem:.3f} "
