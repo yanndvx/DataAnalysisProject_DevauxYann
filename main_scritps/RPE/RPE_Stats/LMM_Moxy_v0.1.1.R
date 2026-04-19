@@ -11,7 +11,9 @@
 # ------------------------------------------------------------------------------
 
 # Load packages ----
-
+#install.packages(c("lme4", "lmerTest", "car", "MuMIn", "emmeans", "readr", "readxl", 
+#                   "dplyr", "ggplot2", "DHARMa", "performance", "see", "report", 
+#                   "broom.mixed"))
 library(lme4)
 library(lmerTest)
 library(car)
