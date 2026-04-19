@@ -1,0 +1,8 @@
+This link will allow you to download the full dataset.
+
+============= 
+https://filesender.renater.fr/?s=download&token=00fbf026-7914-41ef-b3ff-4f526a9a3f87
+=============
+
+Once you have downloaded it, you must unzip the file. 
+Becareful, your arborescence must look like : .......\DataAnalysisProject\data\MOXY-BIDS\….
