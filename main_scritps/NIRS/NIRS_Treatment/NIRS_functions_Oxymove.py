@@ -8,7 +8,7 @@ from mne_bids import BIDSPath, read_raw_bids
 from scipy.signal import hilbert
 
 # Install the external dependencies with pip if they are not already available:
-# mne, matplotlib, numpy, pandas, and mne-bids.
+# pip install mne matplotlib numpy pandas mne-bids scipy h5py
 
 """# NIRS Oxymove Utilities
 
