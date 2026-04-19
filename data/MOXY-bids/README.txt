@@ -16,7 +16,9 @@ Plaintext
 │       └── sub-01_task-contraction_nirs.json   # Acquisition parameters
 ├── sub-02/                   # Data for Subject 02
 │   └── ...
-└── ... (N=23)
+└── ... (N=3)
+
+TO PREVENT FILES WEIGHT PROBLEM, ONLY 3 PARTICIPANTS HAVE BEEN ADDED TO THIS REPOSITORY, STILL STATISTICAL ANALYSIS HAVE BEEN PERFORMED ON FULL DATASET. 
 
 📊 Acquisition Details
 
@@ -38,7 +40,7 @@ The .snirf files in this directory are designed to be processed by the Python sc
 
 📝 Naming Conventions
 
-    Subjects: sub-XX (e.g., sub-01 to sub-23).
+    Subjects: sub-XXX (e.g., sub-001 to sub-003).
 
     Task: task-contraction.
 
